@@ -1,0 +1,335 @@
+#!/usr/bin/perl -w
+#############################################################################
+# $Id: dshbak 1335 2011-04-28 14:35:36Z mark.grondona $
+#############################################################################
+#
+#  Copyright (C) 2001-2006 The Regents of the University of California.
+#  Copyright (C) 2007-2011 Lawrence Livermore National Security, LLC.
+#  Produced at Lawrence Livermore National Laboratory (cf, DISCLAIMER).
+#  Written by Jim Garlick <garlick@llnl.gov>.
+#  UCRL-CODE-2003-005.
+#
+#  This file is part of Pdsh, a parallel remote shell program.
+#  For details, see <http://www.llnl.gov/linux/pdsh/>.
+#
+#  Pdsh is free software; you can redistribute it and/or modify it under
+#  the terms of the GNU General Public License as published by the Free
+#  Software Foundation; either version 2 of the License, or (at your option)
+#  any later version.
+#
+#  Pdsh is distributed in the hope that it will be useful, but WITHOUT ANY
+#  WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+#  FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+#  details.
+#
+#  You should have received a copy of the GNU General Public License along
+#  with Pdsh; if not, write to the Free Software Foundation, Inc.,
+#  59 Temple Place, Suite 330, Boston, MA  02111-1307  USA.
+#
+#############################################################################
+
+require 5.003;
+use strict;
+
+use Getopt::Std;
+use File::Basename qw/ basename /;
+use File::Path;
+
+use constant GETOPTS_ARGS => "chfd:";
+use vars map { "\$opt_$_" } split(/:*/, GETOPTS_ARGS);
+
+#############################################################################
+my $prog  = basename $0;
+my $usage = <<EOF;
+Usage: $prog [OPTION]...
+ -h       Display this help message
+ -c       Coalesce identical output from hosts
+ -d DIR   Send output to files in DIR, one file per host
+ -f       With -d, force creation of DIR
+EOF
+
+#
+#  Save the desired output type in output_fn, which
+#   can be do_output_normal, do_output_per_file, or do_output_coalesced.
+#
+my $output_fn = \&do_output_normal;
+
+#############################################################################
+
+getopts(GETOPTS_ARGS) or usage();
+
+#############################################################################
+#
+#  Process args:
+#
+$opt_h and usage(0);
+
+if ($opt_c) {
+	&log_fatal ("Do not specify both -c and -d\n") if ($opt_d);
+	$output_fn = \&do_output_coalesced;
+}
+
+if ($opt_d) {
+    if ($opt_f and not -d $opt_d) {
+		eval { mkpath ($opt_d) };
+		&log_fatal ("Failed to create $opt_d: $@\n") if ($@);
+	}
+	-d $opt_d or &log_fatal ("Output directory $opt_d does not exist\n");
+
+	$output_fn = \&do_output_per_file;
+}
+
+&log_fatal ("Option -f may only be used with -d\n") if ($opt_f && !$opt_d);
+
+
+#############################################################################
+#
+#  Grab all lines of input and produce output:
+#
+my %lines = &process_lines ();
+&$output_fn ($_) for (sortn (keys %lines));
+
+exit 0;
+#############################################################################
+#
+#  Functions:
+#
+#
+sub log_msg   { print STDERR "$prog: ", @_;       }
+sub log_fatal { &log_msg ("Fatal: ", @_); exit 1; }
+
+#
+#  Read lines of stdin produced from pdsh and push onto a hash
+#   per host prefix.
+#
+sub process_lines
+{
+	my %lines = ();
+	#
+	# Stdin consists of lines of the form "hostname: output...".
+	# Store these in a hash, keyed by hostname, of lists of lines.
+	#
+	while (<>) {
+		my ($tag, $data) = m/^\s*(\S+?)\s*: ?(.*\n)$/;
+		#  Ignore lines that aren't prefixed with a hostname:
+		next unless $tag;
+		push(@{$lines{$tag}}, $data);
+	}
+	return %lines;
+}
+
+#
+#  Print the standard dshbak header
+#
+sub print_header
+{
+	my $div = "----------------\n";
+	print $div, join (",", @_), "\n", $div
+}
+
+#
+#  Normal output function
+#
+sub do_output_normal
+{
+	my ($tag) = @_;
+	&print_header ($tag);
+	print @{$lines{$tag}};
+}
+
+#
+#  Put each host output into separate files in directory
+#   specified by $opt_d.
+#
+sub do_output_per_file
+{
+	my ($tag) = @_;
+	my $file = "$opt_d/$tag";
+	open (OUTPUT, ">$file") ||
+		&log_fatal ("Failed to open output file '$file': $!\n");
+
+	print OUTPUT @{$lines{$tag}};
+}
+
+#
+#  Print identical output only once, tagged with the list of
+#   hosts producing matching data.
+#
+sub do_output_coalesced
+{
+	my ($tag) = @_;
+	my @identical = ();
+
+	#
+	#  Ignore any deleted tags, lines from these hosts has already
+	#   been printed:
+	#
+	return if not defined ($lines{$tag});
+
+	#
+	#  Look for other hosts with identical output:
+	#
+	for my $tag2 (keys %lines) {
+		next if ($tag2 eq $tag);
+		next unless (cmp_list ($lines{$tag}, $lines{$tag2}));
+		#
+		#  Output is identical -- stash the tag of this match and
+		#   delete it from further processing:
+		#
+		push (@identical, $tag2);
+		delete ($lines{$tag2});
+	}
+
+	&print_header (compress (sort (@identical, $tag)));
+	print @{$lines{$tag}};
+}
+
+#
+# Compare two lists-o-strings
+#	\@l1 (IN)	list1
+#	\@l2 (IN)	list2
+#	RETURN		1 if match, 0 if not
+#
+sub cmp_list
+{
+	my ($l1, $l2) = @_;
+	my ($i, $retval);
+
+	$retval = 1;
+
+	if ($#{$l1} != $#{$l2}) {
+		return 0;
+	}
+	for ($i = 0; $i <= $#{$l1} && $retval == 1; $i++) {
+		if (!defined(${$l2}[$i]) || ${$l1}[$i] ne ${$l2}[$i]) {
+			$retval = 0;
+		}
+	}
+
+	return $retval;
+}
+
+sub usage
+{
+	my ($rc) = $@ ? $@ : 0;
+	printf STDERR $usage;
+	exit $rc;
+}
+
+
+#
+#  Try to compress a list of hosts into a host range
+#
+sub compress 
+{
+	my %suffixes = ();
+	my @list = ();
+ 
+	#   Each suffix key points to a list of hostnames with corresponding
+	#    suffix stripped off.
+	push (@{$suffixes{$$_[1]}}, $$_[0]) 
+	   for map { [/(.*?\d*)(\D*)$/] } sortn (@_);
+
+	#
+	#   For each suffix, run compress on hostnames without suffix, then
+	#    reapply suffix name.
+	for my $suffix (keys %suffixes) {
+	    map { push (@list, "$_$suffix") } 
+	        compress_inner (@{$suffixes{$suffix}}); 
+	}
+
+	local $"=",";
+	return wantarray ?  @list : "@list";
+}
+
+
+sub compress_inner
+{
+	my %rng = comp(@_);
+	my @list = ();
+
+	local $"=",";
+
+	@list = map {  $_ .
+		      (@{$rng{$_}}>1 || ${$rng{$_}}[0] =~ /-/ ?
+		                "[@{$rng{$_}}]" :
+				 "@{$rng{$_}}"
+		      )
+	            } sort keys %rng;
+
+	return wantarray ? @list : "@list";
+}
+
+#
+#  Return the zeropadding, if any, of $n: 
+#
+sub zeropadding
+{
+   my ($n) = @_;
+   return (($n =~ /^0/) and ($n ne "0")) ? length $n : 0;
+}
+
+sub comp
+{
+	my (%i) = ();
+	my (%s) = ();
+
+	# turn off warnings here to avoid perl complaints about 
+	# uninitialized values for members of %i and %s
+	local ($^W) = 0;
+
+
+	for my $host (sortn (@_)) {
+		my ($p, $n) = $host =~ /(.*?)(\d*)$/;
+		my $zp = &zeropadding ($n);
+		#
+		#  $s{$p} is a reference to an array of arrays
+		#   that indicate individual range elements of
+		#   the form [ N_start, N_end]. If only one element
+		#   is present then the range element is a singleton.
+		#
+		#  $i{$p}{$zp}${n} tracks the index of prefix $p and suffix $n
+		#   with zero-padding $zp into the @{$s{$p}} array.
+
+		#
+		#  See if $n-1 exists in the $s{$p} array (with same zero-pad)
+		#
+		my $idx = $i{$p}{$zp}{$n-1};
+		if (defined $idx) {
+			#
+			#  $n - 1 is already in array, so update END:
+			#
+			$s{$p}[$idx][1] = "$n";
+			$i{$p}{$zp}{$n-0} = $idx;
+		}
+		else {
+			#
+			#   Otherwise, we create a new single entry
+			#    and update $i{} (Use $n-0 to force a number)
+			#
+			push (@{$s{$p}}, [ $n ]);
+			$i{$p}{$zp}{$n-0} = $#{$s{$p}};
+		}
+	}
+
+	#
+	#
+	#  Now return $s{} as a hash of prefixes with a list of range elemts:
+	#   e.g. $s{"host"} = [ "1-10", "25", "100-101" ]
+	#
+	for my $key (keys %s) {
+		@{$s{$key}} =
+			map { $#$_>0 ? "$$_[0]-$$_[$#$_]" : "$$_[0]" }  @{$s{$key}};
+	}
+	return %s;
+}
+
+# sortn:
+#
+# sort a group of alphanumeric strings by the last group of digits on
+# those strings, if such exists (good for numerically suffixed host lists)
+#
+sub sortn
+{
+	map {$$_[0]} sort {($$a[1]||0)<=>($$b[1]||0)} map {[$_,/(\d*)$/]} @_;
+}
